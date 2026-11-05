@@ -8,19 +8,64 @@
 
 import { LIVE_RECENT_LIMIT } from '../shared/constants';
 import { appendStep } from '../shared/storage/db';
-import { getLiveSession, getSettings, setLiveSession } from '../shared/storage/live';
+import { getLiveSession, getSettings, setLiveSession, withLiveLock } from '../shared/storage/live';
 import type {
   Action,
   CaptureEventPayload,
+  LiveSession,
   ModifierKey,
   RawEvent,
   Step,
   StepOrigin,
-  StepSummary,
 } from '../shared/types';
 import { captureVisible } from '../shared/utils/captureQueue';
 import { actionLabel } from '../shared/utils/format';
-import { stopCapture } from './session';
+import { redactStep } from '../shared/utils/redact';
+import { siteAllowed } from '../shared/utils/siteAccess';
+import { sessionCapMs, stopCapture } from './session';
+
+// ── Commit a step ─────────────────────────────────────────────────────────
+
+// Every handler builds its step (including the slow screenshot) with no lock
+// held, then commits it here. The commit re-reads the live session under the
+// lock and drops the step if the session was paused, stopped, or replaced while
+// the screenshot was in flight. It also assigns the index and writes only the
+// fields it owns, so it can never overwrite a Pause or Stop with a stale copy.
+async function commitStep(
+  liveId: string,
+  step: Step,
+  opts: { label?: string; bump?: (live: LiveSession) => void },
+): Promise<boolean> {
+  // Redact before anything is stored or shown. The label is derived from the
+  // redacted action so typed text never reaches the live feed either.
+  const settings = await getSettings();
+  redactStep(step, { maskAllInputs: settings.mask_all_inputs });
+  const label = opts.label ?? actionLabel(step.action);
+
+  return withLiveLock(async () => {
+    const cur = await getLiveSession();
+    if (!cur || cur.id !== liveId || cur.state !== 'capturing') return false;
+
+    step.index = cur.step_count;
+    const newCount = await appendStep(cur.id, step);
+
+    opts.bump?.(cur);
+    cur.recent.push({
+      index: step.index,
+      type: step.action.type,
+      label,
+      url: step.origin.url,
+      timestamp: step.timestamp,
+    });
+    if (cur.recent.length > LIVE_RECENT_LIMIT) cur.recent.shift();
+
+    cur.step_count = newCount;
+    await setLiveSession(cur);
+    // Inside the lock so a Stop that follows cannot be undone by a late badge write.
+    await chrome.action.setBadgeText({ text: String(newCount) });
+    return true;
+  });
+}
 
 // ── Capture event (from content) ──────────────────────────────────────────
 
@@ -33,9 +78,9 @@ export async function handleCaptureEvent(
 
   const settings = await getSettings();
 
-  // Enforce blocklist.
+  // Enforce allowlist, blocklist, and incognito.
   const url = sender.tab?.url ?? sender.url ?? '';
-  if (isBlocklisted(url, settings.domain_blocklist)) {
+  if (!siteAllowed(url, settings, { incognito: sender.tab?.incognito })) {
     return { ok: false };
   }
 
@@ -48,7 +93,7 @@ export async function handleCaptureEvent(
 
   // Guard: max duration.
   const elapsed = Date.now() - live.started_at;
-  if (elapsed >= settings.max_duration_ms) {
+  if (elapsed >= sessionCapMs(settings)) {
     console.log('[coordinator] max_duration reached, stopping');
     await stopCapture();
     return { ok: false };
@@ -57,7 +102,11 @@ export async function handleCaptureEvent(
   // Capture screenshot if settings demand it.
   const screenshot =
     settings.screenshot_on_action && sender.tab?.windowId !== undefined
-      ? await captureVisible({ windowId: sender.tab.windowId, dpr: payload.dpr })
+      ? await captureVisible({
+          windowId: sender.tab.windowId,
+          dpr: payload.dpr,
+          tabId: sender.tab.id,
+        })
       : null;
 
   // Build the action from the raw event.
@@ -82,31 +131,10 @@ export async function handleCaptureEvent(
     annotation: null,
   };
 
-  const newCount = await appendStep(live.id, step);
-
-  // Update stats.
-  incrementStats(live, action.type);
-
-  // Update recent summaries (capped ring buffer).
-  const summary: StepSummary = {
-    index: step.index,
-    type: action.type,
-    label: actionLabel(action),
-    url: origin.url,
-    timestamp: step.timestamp,
-  };
-  live.recent.push(summary);
-  if (live.recent.length > LIVE_RECENT_LIMIT) {
-    live.recent.shift();
-  }
-
-  live.step_count = newCount;
-  await setLiveSession(live);
-
-  // Update badge.
-  await chrome.action.setBadgeText({ text: String(newCount) });
-
-  return { ok: true };
+  const ok = await commitStep(live.id, step, {
+    bump: (cur) => incrementStats(cur, action.type),
+  });
+  return { ok };
 }
 
 // ── Interval screenshot ───────────────────────────────────────────────────
@@ -121,9 +149,13 @@ export async function handleIntervalScreenshot(): Promise<void> {
 
   const settings = await getSettings();
   const url = activeTab.url ?? '';
-  if (isBlocklisted(url, settings.domain_blocklist)) return;
+  if (!siteAllowed(url, settings, { incognito: activeTab.incognito })) return;
 
-  const screenshot = await captureVisible({ windowId: activeTab.windowId, dpr: 1 });
+  const screenshot = await captureVisible({
+    windowId: activeTab.windowId,
+    dpr: 1,
+    tabId: activeTab.id,
+  });
   if (!screenshot) return;
 
   const action: Action = { type: 'screenshot' };
@@ -145,24 +177,12 @@ export async function handleIntervalScreenshot(): Promise<void> {
     annotation: null,
   };
 
-  const newCount = await appendStep(live.id, step);
-
-  live.stats.screenshots++;
-  const summary: StepSummary = {
-    index: step.index,
-    type: 'screenshot',
+  await commitStep(live.id, step, {
     label: 'Screen state',
-    url: origin.url,
-    timestamp: step.timestamp,
-  };
-  live.recent.push(summary);
-  if (live.recent.length > LIVE_RECENT_LIMIT) {
-    live.recent.shift();
-  }
-
-  live.step_count = newCount;
-  await setLiveSession(live);
-  await chrome.action.setBadgeText({ text: String(newCount) });
+    bump: (cur) => {
+      cur.stats.screenshots++;
+    },
+  });
 }
 
 // ── Tab events ────────────────────────────────────────────────────────────
@@ -175,11 +195,11 @@ export async function handleTabActivated(activeInfo: chrome.tabs.TabActiveInfo):
   if (!tab.url) return;
 
   const settings = await getSettings();
-  if (isBlocklisted(tab.url, settings.domain_blocklist)) return;
+  if (!siteAllowed(tab.url, settings, { incognito: tab.incognito })) return;
 
   const screenshot =
     activeInfo.windowId !== undefined
-      ? await captureVisible({ windowId: activeInfo.windowId, dpr: 1 })
+      ? await captureVisible({ windowId: activeInfo.windowId, dpr: 1, tabId: activeInfo.tabId })
       : null;
 
   const action: Action = { type: 'tab_switch', url: tab.url };
@@ -201,21 +221,7 @@ export async function handleTabActivated(activeInfo: chrome.tabs.TabActiveInfo):
     annotation: null,
   };
 
-  const newCount = await appendStep(live.id, step);
-
-  const summary: StepSummary = {
-    index: step.index,
-    type: 'tab_switch',
-    label: actionLabel(action),
-    url: origin.url,
-    timestamp: step.timestamp,
-  };
-  live.recent.push(summary);
-  if (live.recent.length > LIVE_RECENT_LIMIT) live.recent.shift();
-
-  live.step_count = newCount;
-  await setLiveSession(live);
-  await chrome.action.setBadgeText({ text: String(newCount) });
+  await commitStep(live.id, step, {});
 }
 
 export async function handleTabUpdated(
@@ -230,10 +236,12 @@ export async function handleTabUpdated(
   if (changeInfo.status !== 'complete' || !changeInfo.url) return;
 
   const settings = await getSettings();
-  if (isBlocklisted(changeInfo.url, settings.domain_blocklist)) return;
+  if (!siteAllowed(changeInfo.url, settings, { incognito: tab.incognito })) return;
 
   const screenshot =
-    tab.windowId !== undefined ? await captureVisible({ windowId: tab.windowId, dpr: 1 }) : null;
+    tab.windowId !== undefined
+      ? await captureVisible({ windowId: tab.windowId, dpr: 1, tabId })
+      : null;
 
   const action: Action = { type: 'navigate', url: changeInfo.url };
   const origin: StepOrigin = {
@@ -254,23 +262,10 @@ export async function handleTabUpdated(
     annotation: null,
   };
 
-  const newCount = await appendStep(live.id, step);
-
-  incrementStats(live, 'navigate');
-
-  const summary: StepSummary = {
-    index: step.index,
-    type: 'navigate',
-    label: actionLabel(action),
-    url: origin.url,
-    timestamp: step.timestamp,
-  };
-  live.recent.push(summary);
-  if (live.recent.length > LIVE_RECENT_LIMIT) live.recent.shift();
-
-  live.step_count = newCount;
-  await setLiveSession(live);
-  await chrome.action.setBadgeText({ text: String(newCount) });
+  const ok = await commitStep(live.id, step, {
+    bump: (cur) => incrementStats(cur, 'navigate'),
+  });
+  if (!ok) return;
 
   // Re-send capture state to newly loaded tab.
   if (tab.id !== undefined) {
@@ -286,7 +281,7 @@ export async function handleTabCreated(tab: chrome.tabs.Tab): Promise<void> {
 
   const url = tab.url ?? tab.pendingUrl ?? '';
   const settings = await getSettings();
-  if (isBlocklisted(url, settings.domain_blocklist)) return;
+  if (!siteAllowed(url, settings, { incognito: tab.incognito })) return;
 
   const action: Action = { type: 'tab_open', url };
   const origin: StepOrigin = {
@@ -307,21 +302,7 @@ export async function handleTabCreated(tab: chrome.tabs.Tab): Promise<void> {
     annotation: null,
   };
 
-  const newCount = await appendStep(live.id, step);
-
-  const summary: StepSummary = {
-    index: step.index,
-    type: 'tab_open',
-    label: actionLabel(action),
-    url: origin.url,
-    timestamp: step.timestamp,
-  };
-  live.recent.push(summary);
-  if (live.recent.length > LIVE_RECENT_LIMIT) live.recent.shift();
-
-  live.step_count = newCount;
-  await setLiveSession(live);
-  await chrome.action.setBadgeText({ text: String(newCount) });
+  await commitStep(live.id, step, {});
 }
 
 export async function handleTabRemoved(
@@ -350,21 +331,7 @@ export async function handleTabRemoved(
     annotation: null,
   };
 
-  const newCount = await appendStep(live.id, step);
-
-  const summary: StepSummary = {
-    index: step.index,
-    type: 'tab_close',
-    label: 'Close tab',
-    url: '',
-    timestamp: step.timestamp,
-  };
-  live.recent.push(summary);
-  if (live.recent.length > LIVE_RECENT_LIMIT) live.recent.shift();
-
-  live.step_count = newCount;
-  await setLiveSession(live);
-  await chrome.action.setBadgeText({ text: String(newCount) });
+  await commitStep(live.id, step, { label: 'Close tab' });
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────
@@ -461,19 +428,6 @@ function mapButton(code?: number): 'left' | 'right' | 'middle' {
   if (code === 2) return 'right';
   if (code === 1) return 'middle';
   return 'left';
-}
-
-function isBlocklisted(url: string, blocklist: string[]): boolean {
-  if (!url) return false;
-  try {
-    const { hostname } = new URL(url);
-    return blocklist.some((pattern) => {
-      const regex = new RegExp(pattern.replace(/\*/g, '.*'));
-      return regex.test(hostname);
-    });
-  } catch {
-    return false;
-  }
 }
 
 function incrementStats(
